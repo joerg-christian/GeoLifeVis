@@ -1,0 +1,34 @@
+# Build output
+build/
+build-*/
+out/
+cmake-build-*/
+CMakeUserPresets.json
+
+# Compiled shaders (generated at build time)
+*.spv
+
+# IDE / editor files
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+*.sln
+*.vcxproj*
+*.xcodeproj/
+.DS_Store
+
+# Runtime files written by the application
+imgui.ini
+
+# Full GeoLife data set (~700 MB, too large for git - see BUILDING.md)
+data/geoLifeDataSet.txt
+data/*.zip
+
+# Binaries
+*.exe
+*.pdb
+*.ilk
+*.obj
+*.o

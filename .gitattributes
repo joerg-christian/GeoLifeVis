@@ -1,0 +1,9 @@
+# Normalise line endings of text files
+* text=auto
+
+*.sh    text eol=lf
+*.bat   text eol=crlf
+
+*.png   binary
+*.jpg   binary
+*.spv   binary

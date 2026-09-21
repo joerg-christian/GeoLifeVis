@@ -1,0 +1,295 @@
+#version 450
+
+///////////////
+// Constants //
+///////////////
+// Keep in sync with host:
+
+const uint numberOfLabels = 10;
+int maxRowLength = 11;
+int maxColLength = 11;
+int maxKernelSize = 5;
+ivec2 mapResolution = ivec2(1280,1280);
+
+// 3x3 Gauss Kernel Approximation 3x3
+// 1 2 1
+// 2 4 2
+// 1 2 1
+const mat3 kernel3x3 = mat3(0.25,0.5,0.25,0.5,1,0.5,0.25,0.5,0.25);
+
+// Data Structure for the geoLife Data Points
+struct GeoLifeData
+{
+	float x;
+	float y;
+	int year;
+	int month;
+	int day;
+    int weekday;
+	int hour;
+	int minute;
+	int second;
+	int label; //must be 0 <= label < numberOfLabels
+};
+
+// Data Structure for user parameters that set limits within which geoLife data points are consideres
+struct UserParameters 
+{
+    uint maxIndexDataSet;
+    uint resX;
+    uint resY;
+    uint runCompute;
+    int kernelSize;
+    int yearMin;
+    int yearMax;
+    int monthMin;
+    int monthMax;
+    int dayMin;
+    int dayMax;
+    int hourMin;
+    int hourMax;
+    float sigma;
+    int kernelChanged;
+    int labelNA ;
+	int labelWALK;
+	int labelBIKE;
+	int labelBUS;
+	int labelCAR;
+	int labelSUBWAY;
+	int labelTRAIN;
+	int labelAIRPLANE;
+	int labelBOAT;
+	int labelMOTORCYCLE;
+    int labelMonday;
+    int labelTuesday;
+    int labelWednesday;
+    int labelThursday;
+    int labelFriday;
+    int labelSaturday;
+    int labelSunday;
+    int numberOfWorkGroups;
+    float zoom; // A value between 0 and 1. The whole map has sidelength 1. No zoom means m_zoom = 1. Maximum Zoom means m_zoom = 0.1
+    float originX;
+	float originY;
+};
+
+// binding 0: ubo with user parameters 
+layout(std140, set = 0, binding = 0) uniform uboUserParameters 
+{
+    UserParameters parameters;
+} userParameters;
+
+// binding 1: ssbo with geoLifeDataSet
+layout(std140, set = 0, binding = 1) readonly buffer SSBOGeoLifeDataSet
+{
+   GeoLifeData dataSet[];
+}geoLifeData;
+
+// binding 2: output image
+layout(set = 0, binding = 2, r32i ) uniform coherent iimage2D outputImageKDE;
+
+// binding 4: ubo with kde kernel
+layout(std140, set = 0, binding = 4) uniform uboKernel 
+{
+    vec4[121] components;
+} kernel;
+
+// binding 5: ssbo to sync
+layout(std140, set = 0, binding = 5) buffer SSBOSync
+{
+   uvec4 counter; //ß = sync writing zeros  1= sync wrting KDE, 2= sync writing maxima 3= sync parralel reduction
+}syncSSBO;
+
+// binding 6: ssbo for KDE Kernel
+layout(std140, set = 0, binding = 6) buffer SSBOKernel
+{
+   vec4[121] kernel;
+}kernelSSBO;
+
+// Setup workgroup size 
+const uint workgroupSize = 1024;
+layout(local_size_x = workgroupSize, local_size_y = 1, local_size_z = 1) in;
+
+// Helper functions that decides if datapoint is valid
+bool isDataPointValid(UserParameters p, GeoLifeData d)
+{
+    bool useDataPoint = false;
+    if(d.year >= p.yearMin && d.year <= p.yearMax)
+    {
+            if(d.month >= p.monthMin && d.month <= p.monthMax)
+            {
+                if(d.day >= p.dayMin && d.day <= p.dayMax)
+                {
+                    if(d.hour >= p.hourMin && d.hour <= p.hourMax)
+                    {
+                        if(
+                            (1 == p.labelMonday && d.weekday == 1)||
+                            (1 == p.labelTuesday && d.weekday == 2)||
+                            (1 == p.labelWednesday && d.weekday == 3)||
+                            (1 == p.labelThursday && d.weekday == 4)||
+                            (1 == p.labelFriday && d.weekday == 5)||
+                            (1 == p.labelSaturday && d.weekday == 6)||
+                            (1 == p.labelSunday && d.weekday == 7)
+                        )
+                        {
+                            if(p.labelNA == 1 && d.label== 0) useDataPoint = true;
+                            else if(p.labelWALK == 1 && d.label== 1) useDataPoint = true;
+                            else if(p.labelBIKE == 1 && d.label== 2) useDataPoint = true;
+                            else if(p.labelBUS == 1 && d.label== 3) useDataPoint = true;
+                            else if(p.labelCAR == 1 && d.label== 4) useDataPoint = true;
+                            else if(p.labelSUBWAY == 1 && d.label== 5) useDataPoint = true;
+                            else if(p.labelTRAIN == 1 && d.label== 6) useDataPoint = true;
+                            else if(p.labelAIRPLANE == 1 && d.label== 7) useDataPoint = true;
+                            else if(p.labelBOAT == 1 && d.label== 8) useDataPoint = true;
+                            else if(p.labelMOTORCYCLE== 1 && d.label== 9) useDataPoint = true;
+                        }
+                    }
+                }
+            }
+    }
+    return useDataPoint;
+}
+
+#define PI 3.14159265f
+uint zero = 0;
+
+// barrier used for parallel reduction
+void partialGlobalBarrier(uint globelNumOfInvocationsToWaitFor)
+{
+    // set index for syncing parallel reduction maxima
+    uint index = 3; //this is the counter for parralell reduction
+
+    // Wait until all invocations finished then  invocation 0 resets counter
+    atomicAdd(syncSSBO.counter[index],1);
+    while(syncSSBO.counter[index] < globelNumOfInvocationsToWaitFor) {/* Do nothing*/}
+
+    // first invocation resets counter
+    if(gl_GlobalInvocationID.x == 0) atomicExchange(syncSSBO.counter[index],zero);
+    zero = 0;
+}
+
+// syncs all incocations across all work groups
+void barrierBetweenGroups(uint numOfWorkgroups, uint index)
+{
+    // sync within group
+    barrier();
+
+    // sync between groups first invocation of the group does that on behlaf of the group
+    if(gl_LocalInvocationID.x != 0) return;
+    atomicAdd(syncSSBO.counter[index],1);
+    while(syncSSBO.counter[index] < numOfWorkgroups) {/* Do nothing*/}
+
+    // first global invocation resets counter
+    if(gl_GlobalInvocationID.x == 0) atomicExchange(syncSSBO.counter[index],zero);
+    zero = 0;
+}
+
+void main() 
+{
+
+    uint resX = userParameters.parameters.resX;
+    uint resY = userParameters.parameters.resY;
+    float sigma = userParameters.parameters.sigma;
+    int kernelSize = userParameters.parameters.kernelSize;
+
+    // Set some parameters - must be kept in sync with host!
+    //uint stepSize = gl_WorkGroupSize.x; // this alternative if we only is one work group
+    uint numberOfWorkgroups = gl_NumWorkGroups.x * gl_NumWorkGroups.y *gl_NumWorkGroups.z;
+    uint stepSize =  numberOfWorkgroups *  gl_WorkGroupSize.x * gl_WorkGroupSize.y * gl_WorkGroupSize.z;
+    // Write 0 to every pixel of the kde image
+    uint numberOfPixels = mapResolution.x * mapResolution.y; 
+    for (uint i = gl_GlobalInvocationID.x; i < numberOfPixels; i += stepSize)
+    {
+        ivec2 pixelCoordinates = ivec2(i / uint(mapResolution.y), i %uint(mapResolution.y)); 
+        imageStore(outputImageKDE,  pixelCoordinates, ivec4(0,0,0,1));
+    }
+
+    //Wait until all invocations are finished writing 0 to their pixels
+    barrierBetweenGroups(numberOfWorkgroups, 0);
+
+    // Go through data points and decide if to add to the kde image
+    // Work group has a local size (= number of shader invocation). Variables can be shared within a single work group 
+    uint maxIdxGeoLifeData = userParameters.parameters.maxIndexDataSet;
+    for (uint datasetIdx = gl_GlobalInvocationID.x; datasetIdx <= maxIdxGeoLifeData; datasetIdx += stepSize) // gl_GlobalInvocationID.x as alternative
+    {
+        UserParameters p = userParameters.parameters;
+        GeoLifeData d = geoLifeData.dataSet[datasetIdx];
+        ivec2 pos = ivec2(datasetIdx,datasetIdx);
+        if(isDataPointValid(p,d))
+        {
+            // Get texel of current gps position
+            ivec2 texelCoords;
+            float newX = (d.x - p.originX)/p.zoom; // normalized x value of current point wrt to zoomed coord system
+            float newY = ((1 - d.y) - p.originY)/p.zoom; // normalized y value of current point wrt to zoomed coord system
+            texelCoords.x = int(floor(newX * p.resX)); // new x as pixel coordinate 
+            texelCoords.y = int(floor(newY* p.resY));
+
+            // Add gaussians to texel and its neighbours
+            for(int i = -kernelSize; i <= kernelSize; i++)
+            {
+                int rowIndex = maxKernelSize + i;
+                for(int j = -kernelSize; j < kernelSize; j++)
+                {
+                    ivec2 pos = texelCoords + ivec2(i,j);
+                    if(pos.x >0  && pos.y > 0 && pos.x <uint(mapResolution.x)  && pos.y <uint(mapResolution.y) ) // >0 because we use pixel 0,0 as max storage
+                    {
+                        int colIndex = maxKernelSize + j;
+                        int addme = int(1000 * kernel.components[rowIndex * maxRowLength + colIndex].x); // 1000 is an estimate that raises every value in the kerenl above 1
+                        int value = imageAtomicAdd(outputImageKDE, pos, addme) + addme;
+                    }
+                }
+            }
+        }//end if data point is valid
+    }//end loop over data points
+
+    // Wait until all workgroups finished with the histogram
+    barrierBetweenGroups(numberOfWorkgroups,1);
+    
+    // Find stepsize many cumulative Maxima and write them to the first stepsize pixel in he first row of the image
+    int originalValue = imageLoad(outputImageKDE, ivec2(gl_GlobalInvocationID.x,0)).r;
+    int localMax = 0;
+    for (uint i = gl_GlobalInvocationID.x; i < numberOfPixels; i += stepSize)
+    {
+        uint rowIdx = i /uint(mapResolution.y);
+        uint colIdx = i %uint(mapResolution.y);
+        int pixelValue = imageLoad(outputImageKDE, ivec2(rowIdx,colIdx)).r;
+        localMax = max(localMax,pixelValue);
+    }
+    imageStore(outputImageKDE,  ivec2(gl_GlobalInvocationID.x,0), ivec4(localMax,0,0,0));
+
+    // Wait until all workgroups finished writing their maxima our image1D
+    barrierBetweenGroups(numberOfWorkgroups,2);
+    
+    // parallel reduction to find maximum of the the remaining values values in invocation 0, store  max in pixel 0,0
+    uint currentDataLength = stepSize;
+    while(currentDataLength > 0)
+    {
+        uint halfLength = currentDataLength /2;
+        if(gl_GlobalInvocationID.x < halfLength)
+        {
+            int val1 = imageLoad(outputImageKDE, ivec2(gl_GlobalInvocationID.x,0)).r;
+            int val2 = imageLoad(outputImageKDE, ivec2(gl_GlobalInvocationID.x + halfLength,0)).r;
+            imageStore(outputImageKDE, ivec2(gl_GlobalInvocationID.x,0), ivec4(max(val1,val2)));
+            currentDataLength = currentDataLength / 2;
+                
+            // Wait until all involved workgroups finished calculating maximum
+            partialGlobalBarrier(halfLength);
+        }
+        else //invocation id is too big 
+            break;
+    }
+
+    // Restore original KDE Value in the first row but not at (0,0) which contains maximum value
+    if(gl_GlobalInvocationID.x != 0u) 
+    {
+        uint rowIdx = gl_GlobalInvocationID.x /uint(mapResolution.y);
+        uint colIdx = gl_GlobalInvocationID.x %uint(mapResolution.y);
+        imageStore(outputImageKDE, ivec2(rowIdx,colIdx), ivec4(originalValue, 0, 0, 1));
+    }
+    else // first invocation resets counter for next frame
+    {
+        uvec4 zeroVec = uvec4(0,0,0,0);
+        for(uint i=0;i<4;i++)
+            atomicExchange(syncSSBO.counter[i],zeroVec[i]);
+    }
+}// end main()

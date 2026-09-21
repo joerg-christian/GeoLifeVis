@@ -1,0 +1,45 @@
+name: Build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-latest, macos-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake g++ libvulkan-dev glslc libglfw3-dev libglm-dev
+
+      - name: Install dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: brew install vulkan-headers vulkan-loader molten-vk shaderc glfw glm
+
+      - name: Install Vulkan SDK (Windows)
+        if: runner.os == 'Windows'
+        uses: jakoch/install-vulkan-sdk-action@v1
+        with:
+          vulkan_version: latest
+          cache: true
+
+      - name: Configure
+        shell: bash
+        run: |
+          EXTRA_ARGS=""
+          if [ "$RUNNER_OS" = "macOS" ]; then EXTRA_ARGS="-DCMAKE_PREFIX_PATH=$(brew --prefix)"; fi
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release $EXTRA_ARGS
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
