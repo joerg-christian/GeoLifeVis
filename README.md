@@ -9,6 +9,8 @@ renders the result as a heat map on top of a city map. All filters are applied i
 ![C++17](https://img.shields.io/badge/C%2B%2B-17-informational)
 ![Vulkan](https://img.shields.io/badge/Vulkan-1.0%2B-red)
 
+![GeoLife heat map of Beijing: zoom with the mouse wheel and edit the kernel parameters in the UI](docs/screenshot.png)
+
 ## Features
 
 - GPU-side KDE of up to ~18 million GPS points using a Vulkan compute pipeline
@@ -73,6 +75,7 @@ contains the executable.
 │   └── shader.frag         Heat map colouring
 ├── assets/textures/        City map and colour maps
 ├── data/                   Sample data set (the full data set is downloaded separately)
+├── docs/                   Screenshot for this README
 └── third_party/            Vendored Dear ImGui and stb_image
 ```
 
